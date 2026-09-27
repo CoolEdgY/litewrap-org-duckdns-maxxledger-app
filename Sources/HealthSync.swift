@@ -14,6 +14,9 @@ final class HealthSync: ObservableObject {
     @Published private(set) var pendingCount = 0
     @Published private(set) var lastError: String?
     @Published private(set) var isSyncing = false
+    @Published private(set) var healthAsked: Bool?
+    @Published private(set) var lastServerAnswer: String?
+    @Published private(set) var lastSent: String?
 
     private let store = HKHealthStore()
     private let config = AppConfig.shared
@@ -62,6 +65,26 @@ final class HealthSync: ObservableObject {
         lastSync = defaults.object(forKey: "lw.lastSync") as? Date
         daysSent = defaults.integer(forKey: "lw.daysSent")
         pendingCount = pending.count
+        lastServerAnswer = defaults.string(forKey: "lw.lastServerAnswer")
+        lastSent = defaults.string(forKey: "lw.lastSent")
+        refreshAuthStatus()
+    }
+
+    /// Whether iOS already showed the Health permission sheet. (iOS never tells apps which read types were allowed.)
+    func refreshAuthStatus() {
+        guard config.health.enabled, HKHealthStore.isHealthDataAvailable() else { return }
+        let read = Set(sampleTypes.map { $0 as HKObjectType })
+        store.getRequestStatusForAuthorization(toShare: [], read: read) { status, _ in
+            DispatchQueue.main.async { self.healthAsked = (status == .unnecessary) }
+        }
+    }
+
+    func askHealthAccess() {
+        requestAuthorization {
+            self.refreshAuthStatus()
+            self.startObserving()
+            self.syncRecent(days: 7)
+        }
     }
 
     private var pending: [String] {
@@ -104,7 +127,10 @@ final class HealthSync: ObservableObject {
     private func requestAuthorization(_ done: @escaping () -> Void) {
         guard config.health.enabled, HKHealthStore.isHealthDataAvailable() else { return done() }
         let read = Set(sampleTypes.map { $0 as HKObjectType })
-        store.requestAuthorization(toShare: nil, read: read) { _, _ in done() }
+        store.requestAuthorization(toShare: nil, read: read) { _, _ in
+            self.refreshAuthStatus()
+            done()
+        }
     }
 
     // MARK: Background
@@ -187,6 +213,7 @@ final class HealthSync: ObservableObject {
         var sent = 0
         var errorText: String?
         var unauthorized = false
+        var anyData = false
 
         for (index, day) in all.enumerated() {
             if Task.isCancelled || unauthorized {
@@ -199,9 +226,13 @@ final class HealthSync: ObservableObject {
                 continue
             }
             if summary.count <= 1 { continue } // Nothing recorded that day.
+            anyData = true
             switch await post(summary, to: url, token: token) {
             case .ok:
                 sent += 1
+                let text = summary.keys.sorted().map { "\($0) \(summary[$0]!)" }.joined(separator: ", ")
+                defaults.set(text, forKey: "lw.lastSent")
+                DispatchQueue.main.async { self.lastSent = text }
             case .unauthorized:
                 unauthorized = true
                 stillPending.append(day)
@@ -224,7 +255,14 @@ final class HealthSync: ObservableObject {
             }
         }
         if unauthorized { defaults.set(true, forKey: "lw.needsRepair") }
-        let finalError = unauthorized ? "The sync code was reset. Pair again." : errorText
+        if sent > 0 && !unauthorized {
+            defaults.set(false, forKey: "lw.needsRepair")
+            DispatchQueue.main.async { self.needsRepair = false }
+        }
+        var finalError = unauthorized ? "The server refused the sync code (401). Pair again, or update the app if this keeps happening." : errorText
+        if finalError == nil && !anyData && stillPending.isEmpty {
+            finalError = "No Health data found for these days. Check Settings > Health > Data Access & Devices > \(config.name) and turn all categories on."
+        }
         DispatchQueue.main.async {
             self.isSyncing = false
             self.lastError = finalError
@@ -243,12 +281,19 @@ final class HealthSync: ObservableObject {
         request.setValue(token, forHTTPHeaderField: config.tokenHeader)
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let body = String(data: data.prefix(160), encoding: .utf8) ?? ""
+            let answer = "\(code) \(body)"
+            defaults.set(answer, forKey: "lw.lastServerAnswer")
+            DispatchQueue.main.async { self.lastServerAnswer = answer }
             if code == 401 || code == 403 { return .unauthorized }
             if (200..<300).contains(code) { return .ok }
             return .failed("The server answered \(code). Will try again.")
         } catch {
+            let answer = "No connection: \(error.localizedDescription)"
+            defaults.set(answer, forKey: "lw.lastServerAnswer")
+            DispatchQueue.main.async { self.lastServerAnswer = answer }
             return .failed("No connection to the server. Will try again.")
         }
     }

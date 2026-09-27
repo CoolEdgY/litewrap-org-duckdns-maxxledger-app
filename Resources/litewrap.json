@@ -15,6 +15,6 @@
       "weight",
       "bodyFat"
     ],
-    "tokenHeader": "X-LiteWrap-Token"
+    "tokenHeader": "X-Ledger-Token"
   }
 }
