@@ -52,14 +52,17 @@ jobs:
 
       - name: Create Xcode project
         run: |
-          brew install xcodegen
-          xcodegen generate
+          # Download XcodeGen directly: much faster than Homebrew.
+          curl -fsSL -o "$RUNNER_TEMP/xcodegen.zip" https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          "$RUNNER_TEMP/xcodegen/bin/xcodegen" generate || (HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen && xcodegen generate)
 
       - name: Build
         run: |
           xcodebuild -project LiteWrapApp.xcodeproj -scheme LiteWrapApp -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" archive \
-            MARKETING_VERSION="${{ inputs.marketing_version }}" CURRENT_PROJECT_VERSION="${{ inputs.build_number }}"
+            MARKETING_VERSION="${{ inputs.marketing_version }}" CURRENT_PROJECT_VERSION="${{ inputs.build_number }}" \
+            COMPILER_INDEX_STORE_ENABLE=NO -quiet
 
       - name: Upload to Apple
         env:

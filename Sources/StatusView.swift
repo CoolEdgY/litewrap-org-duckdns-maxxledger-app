@@ -34,6 +34,9 @@ struct StatusView: View {
                         if let s = sync.lastSent {
                             LabeledContent("Last sent", value: s).font(.footnote)
                         }
+                        if let w = sync.workoutsAnswer {
+                            LabeledContent("Workouts", value: w).font(.footnote)
+                        }
                         if sync.needsRepair {
                             Text("Pair again: open settings in \(config.name) and tap Connect Apple Health.")
                                 .font(.footnote)

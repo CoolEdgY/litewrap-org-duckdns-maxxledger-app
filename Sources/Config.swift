@@ -7,6 +7,7 @@ struct AppConfig: Decodable {
         let enabled: Bool
         let types: [String]
         let tokenHeader: String?
+        let workoutsPath: String?
     }
 
     let name: String

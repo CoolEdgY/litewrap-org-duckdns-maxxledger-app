@@ -17,6 +17,7 @@ final class HealthSync: ObservableObject {
     @Published private(set) var healthAsked: Bool?
     @Published private(set) var lastServerAnswer: String?
     @Published private(set) var lastSent: String?
+    @Published private(set) var workoutsAnswer: String?
 
     private let store = HKHealthStore()
     private let config = AppConfig.shared
@@ -48,6 +49,21 @@ final class HealthSync: ObservableObject {
 
     private var fields: [String] { config.health.types.filter { Self.catalog[$0] != nil } }
 
+    private var workoutsEnabled: Bool { fields.contains("workouts") }
+
+    /// Everything the app asks to read. Workout details need heart rate, energy and distance too.
+    private var readTypes: Set<HKObjectType> {
+        var set = Set(sampleTypes.map { $0 as HKObjectType })
+        if workoutsEnabled {
+            set.insert(HKObjectType.workoutType())
+            for id in [HKQuantityTypeIdentifier.heartRate, .activeEnergyBurned, .distanceWalkingRunning,
+                       .distanceCycling, .distanceSwimming] {
+                if let t = HKQuantityType.quantityType(forIdentifier: id) { set.insert(t) }
+            }
+        }
+        return set
+    }
+
     private var sampleTypes: [HKSampleType] {
         fields.compactMap { field -> HKSampleType? in
             switch Self.catalog[field]! {
@@ -67,15 +83,24 @@ final class HealthSync: ObservableObject {
         pendingCount = pending.count
         lastServerAnswer = defaults.string(forKey: "lw.lastServerAnswer")
         lastSent = defaults.string(forKey: "lw.lastSent")
+        workoutsAnswer = defaults.string(forKey: "lw.workoutsAnswer")
         refreshAuthStatus()
     }
 
     /// Whether iOS already showed the Health permission sheet. (iOS never tells apps which read types were allowed.)
     func refreshAuthStatus() {
         guard config.health.enabled, HKHealthStore.isHealthDataAvailable() else { return }
-        let read = Set(sampleTypes.map { $0 as HKObjectType })
+        let read = readTypes
         store.getRequestStatusForAuthorization(toShare: [], read: read) { status, _ in
             DispatchQueue.main.async { self.healthAsked = (status == .unnecessary) }
+        }
+    }
+
+    /// Shows Apple's Health sheet only if there are types not asked for yet (for example after an update).
+    func ensureAuthorization(_ done: @escaping () -> Void) {
+        guard config.health.enabled, isPaired, HKHealthStore.isHealthDataAvailable() else { return done() }
+        store.getRequestStatusForAuthorization(toShare: [], read: readTypes) { status, _ in
+            if status == .shouldRequest { self.requestAuthorization(done) } else { done() }
         }
     }
 
@@ -104,6 +129,7 @@ final class HealthSync: ObservableObject {
         Keychain.set(token, "token")
         Keychain.set(url, "syncUrl")
         defaults.set(false, forKey: "lw.needsRepair")
+        defaults.set(false, forKey: "lw.workoutsBackfilled")
         DispatchQueue.main.async {
             self.isPaired = true
             self.needsRepair = false
@@ -120,13 +146,14 @@ final class HealthSync: ObservableObject {
         Keychain.delete("token")
         Keychain.delete("syncUrl")
         store.disableAllBackgroundDelivery { _, _ in }
+        observing = false
         pending = []
         DispatchQueue.main.async { self.isPaired = false }
     }
 
     private func requestAuthorization(_ done: @escaping () -> Void) {
         guard config.health.enabled, HKHealthStore.isHealthDataAvailable() else { return done() }
-        let read = Set(sampleTypes.map { $0 as HKObjectType })
+        let read = readTypes
         store.requestAuthorization(toShare: nil, read: read) { _, _ in
             self.refreshAuthStatus()
             done()
@@ -180,6 +207,10 @@ final class HealthSync: ObservableObject {
 
     func syncRecent(days: Int) {
         guard config.health.enabled, isPaired else { return }
+        ensureAuthorization { self.syncRecentNow(days: days) }
+    }
+
+    private func syncRecentNow(days: Int) {
         let list = (0..<days).map { Self.dayString(daysAgo: $0) }
         Task { await run(list) }
     }
@@ -268,6 +299,9 @@ final class HealthSync: ObservableObject {
             self.lastError = finalError
             if unauthorized { self.needsRepair = true }
         }
+        if workoutsEnabled && !unauthorized {
+            await syncWorkouts(token: token, syncURL: url)
+        }
         await gate.leave()
     }
 
@@ -295,6 +329,159 @@ final class HealthSync: ObservableObject {
             defaults.set(answer, forKey: "lw.lastServerAnswer")
             DispatchQueue.main.async { self.lastServerAnswer = answer }
             return .failed("No connection to the server. Will try again.")
+        }
+    }
+
+    // MARK: Workouts
+
+    /// Where workouts go: "workoutsPath" from litewrap.json, else the sync address with /sync replaced by /workouts.
+    private func workoutsURL(from syncURL: URL) -> URL? {
+        if let path = config.health.workoutsPath, !path.isEmpty {
+            return URL(string: path, relativeTo: syncURL)?.absoluteURL
+        }
+        let s = syncURL.absoluteString
+        guard s.hasSuffix("/sync") else { return nil }
+        return URL(string: String(s.dropLast(5)) + "/workouts")
+    }
+
+    /// First time after pairing: the last year. After that: the last 7 days on every sync.
+    private func syncWorkouts(token: String, syncURL: URL) async {
+        guard let url = workoutsURL(from: syncURL) else { return }
+        let backfilled = defaults.bool(forKey: "lw.workoutsBackfilled")
+        let days = backfilled ? 7 : 365
+        guard let start = Calendar.current.date(byAdding: .day, value: -days, to: Calendar.current.startOfDay(for: Date())) else { return }
+        guard let workouts = await fetchWorkouts(since: start) else { return } // Phone locked.
+        if workouts.isEmpty {
+            if !backfilled { defaults.set(true, forKey: "lw.workoutsBackfilled") }
+            return
+        }
+        var allOK = true
+        var answer = ""
+        var index = 0
+        while index < workouts.count {
+            let batch = Array(workouts[index..<min(index + 500, workouts.count)])
+            index += 500
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 60
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(token, forHTTPHeaderField: config.tokenHeader)
+            request.httpBody = try? JSONSerialization.data(withJSONObject: ["workouts": batch])
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if (200..<300).contains(code) {
+                    let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                    answer = (json?["message"] as? String) ?? "Saved \(batch.count) workouts"
+                } else {
+                    allOK = false
+                    answer = "Workouts: server answered \(code)"
+                    break
+                }
+            } catch {
+                allOK = false
+                answer = "Workouts: no connection, will try again"
+                break
+            }
+        }
+        if allOK && !backfilled { defaults.set(true, forKey: "lw.workoutsBackfilled") }
+        defaults.set(answer, forKey: "lw.workoutsAnswer")
+        DispatchQueue.main.async { self.workoutsAnswer = answer }
+    }
+
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        f.timeZone = .current
+        return f
+    }()
+
+    /// Returns nil when Health data can't be read (phone locked).
+    private func fetchWorkouts(since start: Date) async -> [[String: Any]]? {
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: nil, options: .strictStartDate)
+        let sort = [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]
+        let samples: [HKWorkout]? = await withCheckedContinuation { cont in
+            let q = HKSampleQuery(sampleType: HKObjectType.workoutType(), predicate: predicate,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: sort) { _, samples, error in
+                if self.isLocked(error) { return cont.resume(returning: nil) }
+                cont.resume(returning: (samples as? [HKWorkout]) ?? [])
+            }
+            store.execute(q)
+        }
+        guard let samples else { return nil }
+        return samples.map { w in
+            var d: [String: Any] = [
+                "id": w.uuid.uuidString,
+                "type": Self.activityName(w.workoutActivityType),
+                "day": Self.formatter.string(from: w.startDate),
+                "start": Self.isoFormatter.string(from: w.startDate),
+                "end": Self.isoFormatter.string(from: w.endDate),
+                "minutes": (w.duration / 60 * 10).rounded() / 10
+            ]
+            if let indoor = w.metadata?[HKMetadataKeyIndoorWorkout] as? NSNumber {
+                d["indoor"] = indoor.boolValue
+            }
+            if let kcal = w.statistics(for: HKQuantityType(.activeEnergyBurned))?.sumQuantity()?.doubleValue(for: .kilocalorie()), kcal > 0 {
+                d["kcal"] = Int(kcal.rounded())
+            }
+            var meters = 0.0
+            for id in [HKQuantityTypeIdentifier.distanceWalkingRunning, .distanceCycling, .distanceSwimming] {
+                meters += w.statistics(for: HKQuantityType(id))?.sumQuantity()?.doubleValue(for: .meter()) ?? 0
+            }
+            if meters > 0 { d["km"] = (meters / 10).rounded() / 100 }
+            if let hr = w.statistics(for: HKQuantityType(.heartRate))?.averageQuantity()?.doubleValue(for: HKUnit.count().unitDivided(by: .minute())), hr > 0 {
+                d["hr"] = Int(hr.rounded())
+            }
+            return d
+        }
+    }
+
+    static func activityName(_ t: HKWorkoutActivityType) -> String {
+        switch t {
+        case .running: return "running"
+        case .walking: return "walking"
+        case .cycling: return "cycling"
+        case .traditionalStrengthTraining: return "traditionalStrengthTraining"
+        case .functionalStrengthTraining: return "functionalStrengthTraining"
+        case .highIntensityIntervalTraining: return "highIntensityIntervalTraining"
+        case .swimming: return "swimming"
+        case .yoga: return "yoga"
+        case .hiking: return "hiking"
+        case .rowing: return "rowing"
+        case .elliptical: return "elliptical"
+        case .coreTraining: return "coreTraining"
+        case .crossTraining: return "crossTraining"
+        case .mixedCardio: return "mixedCardio"
+        case .stairClimbing: return "stairClimbing"
+        case .stairs: return "stairs"
+        case .stepTraining: return "stepTraining"
+        case .pilates: return "pilates"
+        case .flexibility: return "flexibility"
+        case .cooldown: return "cooldown"
+        case .dance, .cardioDance: return "dance"
+        case .socialDance: return "socialDance"
+        case .boxing: return "boxing"
+        case .kickboxing: return "kickboxing"
+        case .martialArts: return "martialArts"
+        case .jumpRope: return "jumpRope"
+        case .soccer: return "soccer"
+        case .basketball: return "basketball"
+        case .tennis: return "tennis"
+        case .badminton: return "badminton"
+        case .tableTennis: return "tableTennis"
+        case .pickleball: return "pickleball"
+        case .squash: return "squash"
+        case .golf: return "golf"
+        case .climbing: return "climbing"
+        case .crossCountrySkiing: return "crossCountrySkiing"
+        case .downhillSkiing: return "downhillSkiing"
+        case .snowboarding: return "snowboarding"
+        case .paddleSports: return "paddleSports"
+        case .mindAndBody: return "mindAndBody"
+        case .preparationAndRecovery: return "preparationAndRecovery"
+        case .taiChi: return "taiChi"
+        case .barre: return "barre"
+        default: return "other"
         }
     }
 
