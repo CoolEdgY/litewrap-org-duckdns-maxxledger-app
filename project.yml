@@ -1,0 +1,75 @@
+{
+  "name": "LiteWrapApp",
+  "options": {
+    "deploymentTarget": {
+      "iOS": "17.0"
+    },
+    "createIntermediateGroups": true
+  },
+  "settings": {
+    "base": {
+      "SWIFT_VERSION": "5.0"
+    }
+  },
+  "targets": {
+    "LiteWrapApp": {
+      "type": "application",
+      "platform": "iOS",
+      "sources": [
+        "Sources",
+        "Resources"
+      ],
+      "info": {
+        "path": "Info.plist",
+        "properties": {
+          "CFBundleDisplayName": "Maxxledger",
+          "CFBundleName": "Maxxledger",
+          "CFBundleShortVersionString": "$(MARKETING_VERSION)",
+          "CFBundleVersion": "$(CURRENT_PROJECT_VERSION)",
+          "LSRequiresIPhoneOS": true,
+          "UILaunchScreen": {},
+          "UIApplicationSceneManifest": {
+            "UIApplicationSupportsMultipleScenes": false
+          },
+          "UISupportedInterfaceOrientations": [
+            "UIInterfaceOrientationPortrait"
+          ],
+          "UIRequiresFullScreen": true,
+          "ITSAppUsesNonExemptEncryption": false,
+          "BGTaskSchedulerPermittedIdentifiers": [
+            "org.duckdns.maxxledger.app.refresh"
+          ],
+          "UIBackgroundModes": [
+            "fetch"
+          ],
+          "NSHealthShareUsageDescription": "Maxxledger reads your activity, heart rate and weight from Apple Health to fill in your pages.",
+          "NSHealthUpdateUsageDescription": "Maxxledger reads your activity, heart rate and weight from Apple Health to fill in your pages."
+        }
+      },
+      "scheme": {},
+      "settings": {
+        "base": {
+          "PRODUCT_BUNDLE_IDENTIFIER": "org.duckdns.maxxledger.app",
+          "PRODUCT_NAME": "LiteWrapApp",
+          "TARGETED_DEVICE_FAMILY": "1",
+          "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
+          "GENERATE_INFOPLIST_FILE": "NO",
+          "MARKETING_VERSION": "1.0.0",
+          "CURRENT_PROJECT_VERSION": "1",
+          "CODE_SIGN_STYLE": "Manual",
+          "DEVELOPMENT_TEAM": "HVQYLCQ5X5",
+          "CODE_SIGN_IDENTITY": "Apple Distribution",
+          "PROVISIONING_PROFILE_SPECIFIER": "LiteWrap org.duckdns.maxxledger.app"
+        }
+      },
+      "entitlements": {
+        "path": "LiteWrapApp.entitlements",
+        "properties": {
+          "com.apple.developer.healthkit": true,
+          "com.apple.developer.healthkit.access": [],
+          "com.apple.developer.healthkit.background-delivery": true
+        }
+      }
+    }
+  }
+}

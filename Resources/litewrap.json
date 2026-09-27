@@ -1,0 +1,20 @@
+{
+  "name": "Maxxledger",
+  "startUrl": "https://maxxledger.duckdns.org",
+  "themeColor": "#0B1013",
+  "backgroundColor": "#0B1013",
+  "health": {
+    "enabled": true,
+    "types": [
+      "active",
+      "resting",
+      "steps",
+      "exerciseMinutes",
+      "rhr",
+      "workouts",
+      "weight",
+      "bodyFat"
+    ],
+    "tokenHeader": "X-LiteWrap-Token"
+  }
+}
