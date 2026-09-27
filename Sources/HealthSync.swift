@@ -344,21 +344,19 @@ final class HealthSync: ObservableObject {
         return URL(string: String(s.dropLast(5)) + "/workouts")
     }
 
-    /// First time after pairing: the last year. After that: the last 7 days on every sync.
+    /// First time after pairing: every workout in Apple Health. After that: the last 7 days on every sync.
     private func syncWorkouts(token: String, syncURL: URL) async {
         guard let url = workoutsURL(from: syncURL) else { return }
         let backfilled = defaults.bool(forKey: "lw.workoutsBackfilled")
-        let days = backfilled ? 7 : 365
-        guard let start = Calendar.current.date(byAdding: .day, value: -days, to: Calendar.current.startOfDay(for: Date())) else { return }
+        let start = backfilled
+            ? (Calendar.current.date(byAdding: .day, value: -7, to: Calendar.current.startOfDay(for: Date())) ?? Date())
+            : Date.distantPast
         guard let workouts = await fetchWorkouts(since: start) else { return } // Phone locked.
-        if workouts.isEmpty {
-            if !backfilled { defaults.set(true, forKey: "lw.workoutsBackfilled") }
-            return
-        }
         var allOK = true
         var answer = ""
         var index = 0
-        while index < workouts.count {
+        // Always call the server, also with an empty list, so it can see the phone checked.
+        repeat {
             let batch = Array(workouts[index..<min(index + 500, workouts.count)])
             index += 500
             var request = URLRequest(url: url)
@@ -373,6 +371,9 @@ final class HealthSync: ObservableObject {
                 if (200..<300).contains(code) {
                     let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
                     answer = (json?["message"] as? String) ?? "Saved \(batch.count) workouts"
+                    if workouts.isEmpty {
+                        answer = "No workouts found in Apple Health. Check Settings > Health > Data Access & Devices > \(config.name) and turn Workouts on."
+                    }
                 } else {
                     allOK = false
                     answer = "Workouts: server answered \(code)"
@@ -383,8 +384,8 @@ final class HealthSync: ObservableObject {
                 answer = "Workouts: no connection, will try again"
                 break
             }
-        }
-        if allOK && !backfilled { defaults.set(true, forKey: "lw.workoutsBackfilled") }
+        } while index < workouts.count
+        if allOK && !backfilled && !workouts.isEmpty { defaults.set(true, forKey: "lw.workoutsBackfilled") }
         defaults.set(answer, forKey: "lw.workoutsAnswer")
         DispatchQueue.main.async { self.workoutsAnswer = answer }
     }
