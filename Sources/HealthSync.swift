@@ -18,6 +18,7 @@ final class HealthSync: ObservableObject {
     @Published private(set) var lastServerAnswer: String?
     @Published private(set) var lastSent: String?
     @Published private(set) var workoutsAnswer: String?
+    @Published private(set) var historyStatus: String?
 
     private let store = HKHealthStore()
     private let config = AppConfig.shared
@@ -84,6 +85,7 @@ final class HealthSync: ObservableObject {
         lastServerAnswer = defaults.string(forKey: "lw.lastServerAnswer")
         lastSent = defaults.string(forKey: "lw.lastSent")
         workoutsAnswer = defaults.string(forKey: "lw.workoutsAnswer")
+        historyStatus = defaults.string(forKey: "lw.historyStatus")
         refreshAuthStatus()
     }
 
@@ -130,6 +132,8 @@ final class HealthSync: ObservableObject {
         Keychain.set(url, "syncUrl")
         defaults.set(false, forKey: "lw.needsRepair")
         defaults.set(false, forKey: "lw.workoutsBackfilled")
+        defaults.set(false, forKey: "lw.daysBackfilled")
+        defaults.removeObject(forKey: "lw.backfillCursor")
         DispatchQueue.main.async {
             self.isPaired = true
             self.needsRepair = false
@@ -212,7 +216,7 @@ final class HealthSync: ObservableObject {
 
     private func syncRecentNow(days: Int) {
         let list = (0..<days).map { Self.dayString(daysAgo: $0) }
-        Task { await run(list) }
+        Task { await run(list, backfill: true) }
     }
 
     /// Each wake sends today. Once a day it also resends yesterday, because the Watch often syncs late.
@@ -226,7 +230,8 @@ final class HealthSync: ObservableObject {
         return days
     }
 
-    private func run(_ days: [String]) async {
+    /// backfill: also send history. Only when the app is open; background wakes are too short for it.
+    private func run(_ days: [String], backfill: Bool = false) async {
         guard config.health.enabled, isPaired,
               let token = Keychain.get("token"),
               let urlString = Keychain.get("syncUrl"),
@@ -295,13 +300,16 @@ final class HealthSync: ObservableObject {
             finalError = "No Health data found for these days. Check Settings > Health > Data Access & Devices > \(config.name) and turn all categories on."
         }
         DispatchQueue.main.async {
-            self.isSyncing = false
             self.lastError = finalError
             if unauthorized { self.needsRepair = true }
+        }
+        if backfill && !unauthorized && !defaults.bool(forKey: "lw.daysBackfilled") {
+            await backfillDays(token: token, url: url)
         }
         if workoutsEnabled && !unauthorized {
             await syncWorkouts(token: token, syncURL: url)
         }
+        DispatchQueue.main.async { self.isSyncing = false }
         await gate.leave()
     }
 
@@ -332,6 +340,145 @@ final class HealthSync: ObservableObject {
         }
     }
 
+    // MARK: History (daily summaries, up to 2 years back)
+
+    /// "Sync all history" button: send every day again, then keep going as normal.
+    func syncAllHistory() {
+        defaults.set(false, forKey: "lw.daysBackfilled")
+        defaults.removeObject(forKey: "lw.backfillCursor")
+        defaults.set(false, forKey: "lw.workoutsBackfilled")
+        setHistory("History: starting...")
+        syncRecent(days: 7)
+    }
+
+    private func setHistory(_ text: String) {
+        defaults.set(text, forKey: "lw.historyStatus")
+        DispatchQueue.main.async { self.historyStatus = text }
+    }
+
+    /// Sends one summary per day for every day Apple Health has data, oldest first, one at a time.
+    /// Remembers how far it got, so a background wake that runs out of time continues next time.
+    private func backfillDays(token: String, url: URL) async {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        guard let start = cal.date(byAdding: .year, value: -2, to: today),
+              let end = cal.date(byAdding: .day, value: 1, to: today) else { return }
+        setHistory("History: reading Apple Health...")
+        guard let all = await historySummaries(from: start, to: end) else {
+            setHistory("History: Health data locked (phone locked). Will continue later.")
+            return
+        }
+        let cursor = defaults.string(forKey: "lw.backfillCursor") ?? ""
+        let days = all.keys.sorted()
+        let todo = days.filter { $0 > cursor }
+        var sent = days.count - todo.count
+        for day in todo {
+            if Task.isCancelled { return }
+            var body = all[day]!
+            body["date"] = day
+            switch await post(body, to: url, token: token) {
+            case .ok:
+                sent += 1
+                defaults.set(day, forKey: "lw.backfillCursor")
+                if sent % 10 == 0 || sent == days.count {
+                    setHistory("History: \(sent) of \(days.count) days sent")
+                }
+            case .unauthorized:
+                setHistory("History: the server refused the sync code. Pair again.")
+                defaults.set(true, forKey: "lw.needsRepair")
+                DispatchQueue.main.async { self.needsRepair = true }
+                return
+            case .failed(let msg):
+                setHistory("History: \(sent) of \(days.count) days sent. Stopped: \(msg)")
+                return
+            }
+        }
+        defaults.set(true, forKey: "lw.daysBackfilled")
+        setHistory("History: done, \(days.count) days sent")
+    }
+
+    /// All day summaries between two dates, built with a few bulk queries instead of one per day.
+    /// Returns nil when Health data can't be read (phone locked).
+    private func historySummaries(from start: Date, to end: Date) async -> [String: [String: Any]]? {
+        var out: [String: [String: Any]] = [:]
+        for field in fields {
+            let result: [String: Double]?
+            switch Self.catalog[field]! {
+            case .sum(let id, let unit):
+                result = await dailySums(id, unit, start, end)
+            case .latest(let id, let unit, let factor):
+                result = await dailyLatest(id, unit, factor, start, end)
+            case .workouts:
+                result = await dailyWorkoutCounts(start, end)
+            }
+            guard let values = result else { return nil }
+            for (day, v) in values {
+                var d = out[day] ?? [:]
+                if ["weight", "bodyFat"].contains(field) {
+                    d[field] = (v * 10).rounded() / 10
+                } else {
+                    d[field] = Int(v.rounded())
+                }
+                out[day] = d
+            }
+        }
+        return out
+    }
+
+    private func dailySums(_ id: HKQuantityTypeIdentifier, _ unit: HKUnit, _ start: Date, _ end: Date) async -> [String: Double]? {
+        guard let type = HKQuantityType.quantityType(forIdentifier: id) else { return [:] }
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        return await withCheckedContinuation { cont in
+            let q = HKStatisticsCollectionQuery(quantityType: type, quantitySamplePredicate: predicate,
+                                                options: .cumulativeSum, anchorDate: start,
+                                                intervalComponents: DateComponents(day: 1))
+            q.initialResultsHandler = { _, results, error in
+                if self.isLocked(error) { return cont.resume(returning: nil) }
+                var values: [String: Double] = [:]
+                results?.enumerateStatistics(from: start, to: end) { stats, _ in
+                    if let v = stats.sumQuantity()?.doubleValue(for: unit), v > 0 {
+                        values[Self.formatter.string(from: stats.startDate)] = v
+                    }
+                }
+                cont.resume(returning: values)
+            }
+            store.execute(q)
+        }
+    }
+
+    private func dailyLatest(_ id: HKQuantityTypeIdentifier, _ unit: HKUnit, _ factor: Double, _ start: Date, _ end: Date) async -> [String: Double]? {
+        guard let type = HKQuantityType.quantityType(forIdentifier: id) else { return [:] }
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        let sort = [NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: true)]
+        return await withCheckedContinuation { cont in
+            let q = HKSampleQuery(sampleType: type, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: sort) { _, samples, error in
+                if self.isLocked(error) { return cont.resume(returning: nil) }
+                var values: [String: Double] = [:]
+                for case let s as HKQuantitySample in samples ?? [] {
+                    values[Self.formatter.string(from: s.startDate)] = s.quantity.doubleValue(for: unit) * factor  // later samples win
+                }
+                cont.resume(returning: values)
+            }
+            store.execute(q)
+        }
+    }
+
+    private func dailyWorkoutCounts(_ start: Date, _ end: Date) async -> [String: Double]? {
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        return await withCheckedContinuation { cont in
+            let q = HKSampleQuery(sampleType: HKObjectType.workoutType(), predicate: predicate,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: nil) { _, samples, error in
+                if self.isLocked(error) { return cont.resume(returning: nil) }
+                var values: [String: Double] = [:]
+                for s in samples ?? [] {
+                    values[Self.formatter.string(from: s.startDate), default: 0] += 1
+                }
+                cont.resume(returning: values)
+            }
+            store.execute(q)
+        }
+    }
+
     // MARK: Workouts
 
     /// Where workouts go: "workoutsPath" from litewrap.json, else the sync address with /sync replaced by /workouts.
@@ -339,19 +486,34 @@ final class HealthSync: ObservableObject {
         if let path = config.health.workoutsPath, !path.isEmpty {
             return URL(string: path, relativeTo: syncURL)?.absoluteURL
         }
-        let s = syncURL.absoluteString
-        guard s.hasSuffix("/sync") else { return nil }
-        return URL(string: String(s.dropLast(5)) + "/workouts")
+        // Replace the last "sync" part of the path with "workouts", ignoring any query or trailing slash.
+        guard var parts = URLComponents(url: syncURL, resolvingAgainstBaseURL: false) else { return nil }
+        var segs = parts.path.split(separator: "/").map(String.init)
+        guard let i = segs.lastIndex(where: { $0.lowercased() == "sync" }) else { return nil }
+        segs[i] = "workouts"
+        parts.path = "/" + segs.joined(separator: "/")
+        parts.query = nil
+        return parts.url
     }
 
     /// First time after pairing: every workout in Apple Health. After that: the last 7 days on every sync.
     private func syncWorkouts(token: String, syncURL: URL) async {
-        guard let url = workoutsURL(from: syncURL) else { return }
+        guard let url = workoutsURL(from: syncURL) else {
+            let msg = "Workouts: can't work out the address from \(syncURL.absoluteString). Add workoutsPath to litewrap.json."
+            defaults.set(msg, forKey: "lw.workoutsAnswer")
+            DispatchQueue.main.async { self.workoutsAnswer = msg }
+            return
+        }
         let backfilled = defaults.bool(forKey: "lw.workoutsBackfilled")
         let start = backfilled
             ? (Calendar.current.date(byAdding: .day, value: -7, to: Calendar.current.startOfDay(for: Date())) ?? Date())
             : Date.distantPast
-        guard let workouts = await fetchWorkouts(since: start) else { return } // Phone locked.
+        guard let workouts = await fetchWorkouts(since: start) else {
+            let msg = "Workouts: Health data locked (phone locked). Will try again."
+            defaults.set(msg, forKey: "lw.workoutsAnswer")
+            DispatchQueue.main.async { self.workoutsAnswer = msg }
+            return
+        }
         var allOK = true
         var answer = ""
         var index = 0
@@ -370,13 +532,13 @@ final class HealthSync: ObservableObject {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if (200..<300).contains(code) {
                     let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-                    answer = (json?["message"] as? String) ?? "Saved \(batch.count) workouts"
+                    answer = (json?["message"] as? String) ?? "Sent \(workouts.count) workouts"
                     if workouts.isEmpty {
-                        answer = "No workouts found in Apple Health. Check Settings > Health > Data Access & Devices > \(config.name) and turn Workouts on."
+                        answer = "Apple Health returned 0 workouts to the app. Server called anyway."
                     }
                 } else {
                     allOK = false
-                    answer = "Workouts: server answered \(code)"
+                    answer = "Workouts: \(url.absoluteString) answered \(code)"
                     break
                 }
             } catch {

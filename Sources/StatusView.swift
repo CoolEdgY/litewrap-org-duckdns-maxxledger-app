@@ -37,6 +37,9 @@ struct StatusView: View {
                         if let w = sync.workoutsAnswer {
                             LabeledContent("Workouts", value: w).font(.footnote)
                         }
+                        if let h = sync.historyStatus {
+                            LabeledContent("History", value: h).font(.footnote)
+                        }
                         if sync.needsRepair {
                             Text("Pair again: open settings in \(config.name) and tap Connect Apple Health.")
                                 .font(.footnote)
@@ -47,6 +50,8 @@ struct StatusView: View {
                     }
                     Section {
                         Button(sync.isSyncing ? "Syncing..." : "Sync now") { sync.syncRecent(days: 7) }
+                            .disabled(!sync.isPaired || sync.isSyncing)
+                        Button("Sync all history (2 years)") { sync.syncAllHistory() }
                             .disabled(!sync.isPaired || sync.isSyncing)
                         if sync.isPaired && sync.healthAsked == false {
                             Button("Allow Health access") { sync.askHealthAccess() }
