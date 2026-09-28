@@ -1,6 +1,7 @@
 import SwiftUI
 import WebKit
 import UIKit
+import SafariServices
 
 /// Owns the WKWebView, the `litewrap` bridge and the offline state.
 final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
@@ -26,8 +27,12 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
         let paired = HealthSync.shared.isPaired ? "true" : "false"
         let health = cfg.health.enabled ? "true" : "false"
         let types = (try? String(data: JSONEncoder().encode(cfg.health.types), encoding: .utf8)) ?? "[]"
-        let js = "window.LiteWrap = {version: 1, health: \(health), paired: \(paired), healthTypes: \(types)};"
+        let features = (try? String(data: JSONEncoder().encode(cfg.features), encoding: .utf8)) ?? "[]"
+        let js = "window.LiteWrap = {version: 1, health: \(health), paired: \(paired), healthTypes: \(types), features: \(features)};"
         content.addUserScript(WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        // Block double-tap zoom but keep pinch zoom and the phone's text size.
+        let noDoubleTap = "var s=document.createElement('style');s.textContent='html{touch-action:manipulation}';document.head&&document.head.appendChild(s);"
+        content.addUserScript(WKUserScript(source: noDoubleTap, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         wk.userContentController = content
 
         webView = WKWebView(frame: .zero, configuration: wk)
@@ -40,6 +45,8 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
         webView.isOpaque = false
         webView.backgroundColor = UIColor(hex: config.backgroundColor ?? config.themeColor ?? "") ?? .systemBackground
         webView.scrollView.backgroundColor = webView.backgroundColor
+        // The page handles the notch and home bar itself with env(safe-area-inset-*).
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
         load()
     }
 
@@ -75,12 +82,44 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
             showStatus = true
         case "sync":
             HealthSync.shared.syncRecent(days: 7)
+        case "scanBarcode":
+            let id = body["id"]
+            let tint = UIColor(hex: config.themeColor ?? "") ?? .systemGreen
+            BarcodeScanner.start(tint: tint) { [weak self] result in
+                switch result {
+                case .code(let code, let format):
+                    self?.notifyPage(["type": "barcode", "code": code, "format": format], id: id)
+                case .cancelled:
+                    self?.notifyPage(["type": "barcodeCancelled"], id: id)
+                case .error(let reason):
+                    self?.notifyPage(["type": "barcodeError", "reason": reason], id: id)
+                }
+            }
+        case "haptic":
+            Haptics.play(body["style"] as? String ?? "light")
+        case "keepAwake":
+            UIApplication.shared.isIdleTimerDisabled = (body["on"] as? Bool) ?? false
+        case "notify":
+            guard let nid = body["id"].map({ "\($0)" }), let at = (body["at"] as? NSNumber)?.doubleValue else { return }
+            Notifier.schedule(id: nid, at: Date(timeIntervalSince1970: at / 1000),
+                              title: body["title"] as? String ?? config.name,
+                              body: body["body"] as? String ?? "",
+                              sound: (body["sound"] as? Bool) ?? true)
+        case "notifyCancel":
+            if let nid = body["id"].map({ "\($0)" }) { Notifier.cancel(nid) }
+        case "notifyPermission":
+            let id = body["id"]
+            Notifier.requestPermission { [weak self] granted in
+                self?.notifyPage(["type": "notifyPermission", "granted": granted], id: id)
+            }
         default:
             break
         }
     }
 
-    private func notifyPage(_ detail: [String: Any]) {
+    private func notifyPage(_ detail: [String: Any], id: Any? = nil) {
+        var detail = detail
+        if let id, !(id is NSNull) { detail["id"] = id }
         guard let data = try? JSONSerialization.data(withJSONObject: detail),
               let json = String(data: data, encoding: .utf8) else { return }
         let paired = HealthSync.shared.isPaired ? "true" : "false"
@@ -102,7 +141,7 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
         if (scheme == "http" || scheme == "https"),
            navigationAction.navigationType == .linkActivated,
            !isInternal(url) {
-            UIApplication.shared.open(url)
+            UIHelpers.openInSafari(url)
             return decisionHandler(.cancel)
         }
         decisionHandler(.allow)
@@ -112,9 +151,17 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         // target="_blank" and window.open: same site loads here, other sites open in Safari.
         if let url = navigationAction.request.url {
-            if isInternal(url) { webView.load(navigationAction.request) } else { UIApplication.shared.open(url) }
+            if isInternal(url) { webView.load(navigationAction.request) } else { UIHelpers.openInSafari(url) }
         }
         return nil
+    }
+
+    /// Camera for the app's own pages: allowed once by iOS, not asked again on every page load.
+    func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        let host = origin.host.lowercased()
+        decisionHandler(host == config.host || host.hasSuffix("." + config.host) ? .grant : .prompt)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

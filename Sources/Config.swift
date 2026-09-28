@@ -15,6 +15,13 @@ struct AppConfig: Decodable {
     let themeColor: String?
     let backgroundColor: String?
     let health: Health
+    let bridges: [String]?
+
+    /// Native features the page may use (window.LiteWrap.features).
+    var features: [String] {
+        let implemented = ["health", "scanBarcode", "haptic", "notify", "keepAwake"]
+        return (bridges ?? ["health"]).filter { implemented.contains($0) && ($0 != "health" || health.enabled) }
+    }
 
     static let shared: AppConfig = {
         guard let url = Bundle.main.url(forResource: "litewrap", withExtension: "json"),

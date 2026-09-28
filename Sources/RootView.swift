@@ -11,8 +11,9 @@ struct RootView: View {
                 config.theme.ignoresSafeArea()
                 config.background.ignoresSafeArea(edges: .bottom)
 
+                // Full screen under the notch and home bar; the page uses env(safe-area-inset-*).
                 WebViewContainer(controller: web)
-                    .ignoresSafeArea(edges: .bottom)
+                    .ignoresSafeArea()
 
                 if web.offline {
                     NoConnectionView { web.retry() }
