@@ -34,7 +34,21 @@ final class HealthSync: ObservableObject {
     enum Kind {
         case sum(HKQuantityTypeIdentifier, HKUnit)
         case latest(HKQuantityTypeIdentifier, HKUnit, Double)
+        case avg(HKQuantityTypeIdentifier, HKUnit, Double)
+        case standHours
+        case sleep(SleepPart)
         case workouts
+    }
+
+    enum SleepPart { case total, deep, rem, core, awake }
+
+    /// Fields sent with decimals; everything else is a whole number.
+    static let decimals: [String: Double] = ["weight": 10, "bodyFat": 10, "walkingKm": 100, "vo2Max": 10,
+                                             "respiratoryRate": 10, "oxygen": 10]
+
+    static func rounded(_ field: String, _ v: Double) -> Any {
+        if let f = decimals[field] { return (v * f).rounded() / f }
+        return Int(v.rounded())
     }
 
     static let catalog: [String: Kind] = [
@@ -45,7 +59,20 @@ final class HealthSync: ObservableObject {
         "rhr": .latest(.restingHeartRate, HKUnit.count().unitDivided(by: .minute()), 1),
         "weight": .latest(.bodyMass, .gramUnit(with: .kilo), 1),
         "bodyFat": .latest(.bodyFatPercentage, .percent(), 100),
-        "workouts": .workouts
+        "workouts": .workouts,
+        "hrv": .avg(.heartRateVariabilitySDNN, .secondUnit(with: .milli), 1),
+        "walkingHeartRate": .avg(.walkingHeartRateAverage, HKUnit.count().unitDivided(by: .minute()), 1),
+        "vo2Max": .latest(.vo2Max, HKUnit(from: "ml/kg*min"), 1),
+        "standHours": .standHours,
+        "walkingKm": .sum(.distanceWalkingRunning, .meterUnit(with: .kilo)),
+        "flights": .sum(.flightsClimbed, .count()),
+        "sleepMinutes": .sleep(.total),
+        "sleepDeep": .sleep(.deep),
+        "sleepRem": .sleep(.rem),
+        "sleepCore": .sleep(.core),
+        "sleepAwake": .sleep(.awake),
+        "respiratoryRate": .avg(.respiratoryRate, HKUnit.count().unitDivided(by: .minute()), 1),
+        "oxygen": .avg(.oxygenSaturation, .percent(), 100)
     ]
 
     private var fields: [String] { config.health.types.filter { Self.catalog[$0] != nil } }
@@ -66,14 +93,19 @@ final class HealthSync: ObservableObject {
     }
 
     private var sampleTypes: [HKSampleType] {
-        fields.compactMap { field -> HKSampleType? in
+        var seen = Set<String>()
+        return fields.compactMap { field -> HKSampleType? in
             switch Self.catalog[field]! {
-            case .sum(let id, _), .latest(let id, _, _):
+            case .sum(let id, _), .latest(let id, _, _), .avg(let id, _, _):
                 return HKQuantityType.quantityType(forIdentifier: id)
+            case .standHours:
+                return HKCategoryType(.appleStandHour)
+            case .sleep:
+                return HKCategoryType(.sleepAnalysis)
             case .workouts:
                 return HKObjectType.workoutType()
             }
-        }
+        }.filter { seen.insert($0.identifier).inserted }
     }
 
     private init() {
@@ -142,7 +174,10 @@ final class HealthSync: ObservableObject {
         requestAuthorization {
             self.startObserving()
             self.syncRecent(days: 7)
-            DispatchQueue.main.async { done() }
+            DispatchQueue.main.async {
+                self.startLiveToday()
+                done()
+            }
         }
     }
 
@@ -182,7 +217,9 @@ final class HealthSync: ObservableObject {
                 }
             }
             store.execute(query)
-            store.enableBackgroundDelivery(for: type, frequency: .hourly) { _, _ in }
+            let fast = [HKQuantityTypeIdentifier.stepCount.rawValue, HKQuantityTypeIdentifier.activeEnergyBurned.rawValue]
+            // Steps and active energy as often as iOS allows; everything else hourly.
+            store.enableBackgroundDelivery(for: type, frequency: fast.contains(type.identifier) ? .immediate : .hourly) { _, _ in }
         }
     }
 
@@ -205,6 +242,44 @@ final class HealthSync: ObservableObject {
         let request = BGAppRefreshTaskRequest(identifier: refreshId)
         request.earliestBeginDate = Date(timeIntervalSinceNow: 4 * 3600)
         try? BGTaskScheduler.shared.submit(request)
+    }
+
+    // MARK: Today, while the app is open
+
+    private var liveTimer: Timer?
+    private var lastLive: (steps: Int?, active: Int?) = (nil, nil)
+
+    /// While the app is in front: every 60 s, send today's row again if steps or active energy changed.
+    func startLiveToday() {
+        guard config.health.enabled, isPaired, liveTimer == nil else { return }
+        liveTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { await self?.sendTodayIfChanged() }
+        }
+    }
+
+    func stopLiveToday() {
+        liveTimer?.invalidate()
+        liveTimer = nil
+    }
+
+    private func sendTodayIfChanged() async {
+        guard config.health.enabled, isPaired,
+              let token = Keychain.get("token"), let urlString = Keychain.get("syncUrl"),
+              let url = URL(string: urlString) else { return }
+        guard await gate.enter() else { return }
+        let today = Self.dayString(daysAgo: 0)
+        if let summary = await summary(for: today) {
+            let steps = summary["steps"] as? Int, active = summary["active"] as? Int
+            if steps != lastLive.steps || active != lastLive.active, summary.count > 1 {
+                if case .ok = await post(summary, to: url, token: token) {
+                    lastLive = (steps, active)
+                    let now = Date()
+                    defaults.set(now, forKey: "lw.lastSync")
+                    DispatchQueue.main.async { self.lastSync = now }
+                }
+            }
+        }
+        await gate.leave()
     }
 
     // MARK: Sending
@@ -302,6 +377,13 @@ final class HealthSync: ObservableObject {
         DispatchQueue.main.async {
             self.lastError = finalError
             if unauthorized { self.needsRepair = true }
+        }
+        // New Health types since the last history run (for example after an app update): send the history again.
+        let fieldKey = fields.sorted().joined(separator: ",")
+        if defaults.string(forKey: "lw.backfillFields") != fieldKey {
+            defaults.set(false, forKey: "lw.daysBackfilled")
+            defaults.removeObject(forKey: "lw.backfillCursor")
+            defaults.set(fieldKey, forKey: "lw.backfillFields")
         }
         if backfill && !unauthorized && !defaults.bool(forKey: "lw.daysBackfilled") {
             await backfillDays(token: token, url: url)
@@ -401,6 +483,7 @@ final class HealthSync: ObservableObject {
     /// Returns nil when Health data can't be read (phone locked).
     private func historySummaries(from start: Date, to end: Date) async -> [String: [String: Any]]? {
         var out: [String: [String: Any]] = [:]
+        var nights: [String: [SleepPart: Double]]?
         for field in fields {
             let result: [String: Double]?
             switch Self.catalog[field]! {
@@ -408,17 +491,21 @@ final class HealthSync: ObservableObject {
                 result = await dailySums(id, unit, start, end)
             case .latest(let id, let unit, let factor):
                 result = await dailyLatest(id, unit, factor, start, end)
+            case .avg(let id, let unit, let factor):
+                result = await dailyAverages(id, unit, factor, start, end)
+            case .standHours:
+                result = await dailyStandHours(start, end)
+            case .sleep(let part):
+                if nights == nil { nights = await dailySleep(start, end) }
+                guard let n = nights else { return nil }
+                result = n.compactMapValues { $0[part] }
             case .workouts:
                 result = await dailyWorkoutCounts(start, end)
             }
             guard let values = result else { return nil }
-            for (day, v) in values {
+            for (day, v) in values where v > 0 {
                 var d = out[day] ?? [:]
-                if ["weight", "bodyFat"].contains(field) {
-                    d[field] = (v * 10).rounded() / 10
-                } else {
-                    d[field] = Int(v.rounded())
-                }
+                d[field] = Self.rounded(field, v)
                 out[day] = d
             }
         }
@@ -461,6 +548,102 @@ final class HealthSync: ObservableObject {
             }
             store.execute(q)
         }
+    }
+
+    private func dailyAverages(_ id: HKQuantityTypeIdentifier, _ unit: HKUnit, _ factor: Double, _ start: Date, _ end: Date) async -> [String: Double]? {
+        guard let type = HKQuantityType.quantityType(forIdentifier: id) else { return [:] }
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        return await withCheckedContinuation { cont in
+            let q = HKStatisticsCollectionQuery(quantityType: type, quantitySamplePredicate: predicate,
+                                                options: .discreteAverage, anchorDate: start,
+                                                intervalComponents: DateComponents(day: 1))
+            q.initialResultsHandler = { _, results, error in
+                if self.isLocked(error) { return cont.resume(returning: nil) }
+                var values: [String: Double] = [:]
+                results?.enumerateStatistics(from: start, to: end) { stats, _ in
+                    if let v = stats.averageQuantity()?.doubleValue(for: unit), v > 0 {
+                        values[Self.formatter.string(from: stats.startDate)] = v * factor
+                    }
+                }
+                cont.resume(returning: values)
+            }
+            store.execute(q)
+        }
+    }
+
+    /// Hours with the stand ring ticked, per day.
+    private func dailyStandHours(_ start: Date, _ end: Date) async -> [String: Double]? {
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        return await withCheckedContinuation { cont in
+            let q = HKSampleQuery(sampleType: HKCategoryType(.appleStandHour), predicate: predicate,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: nil) { _, samples, error in
+                if self.isLocked(error) { return cont.resume(returning: nil) }
+                var values: [String: Double] = [:]
+                for case let s as HKCategorySample in samples ?? []
+                where s.value == HKCategoryValueAppleStandHour.stood.rawValue {
+                    values[Self.formatter.string(from: s.startDate), default: 0] += 1
+                }
+                cont.resume(returning: values.mapValues { min($0, 24) })
+            }
+            store.execute(q)
+        }
+    }
+
+    /// Sleep in minutes per stage, for the night ending on each morning.
+    /// A sample belongs to the day of its end time plus 6 hours, so sleep before midnight counts for the next morning.
+    /// When a source records stages (the Watch), only that source is used, so phone and Watch are not added twice.
+    private func dailySleep(_ start: Date, _ end: Date) async -> [String: [SleepPart: Double]]? {
+        let from = start.addingTimeInterval(-18 * 3600)
+        let predicate = HKQuery.predicateForSamples(withStart: from, end: end, options: [])
+        let samples: [HKCategorySample]? = await withCheckedContinuation { cont in
+            let q = HKSampleQuery(sampleType: HKCategoryType(.sleepAnalysis), predicate: predicate,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: nil) { _, samples, error in
+                if self.isLocked(error) { return cont.resume(returning: nil) }
+                cont.resume(returning: (samples as? [HKCategorySample]) ?? [])
+            }
+            store.execute(q)
+        }
+        guard let samples else { return nil }
+        let startKey = Self.formatter.string(from: start)
+        let endKey = Self.formatter.string(from: end)
+        var byNight: [String: [HKCategorySample]] = [:]
+        for s in samples {
+            let key = Self.formatter.string(from: s.endDate.addingTimeInterval(6 * 3600))
+            if key >= startKey && key < endKey { byNight[key, default: []].append(s) }
+        }
+        let stages: Set<Int> = [HKCategoryValueSleepAnalysis.asleepCore.rawValue,
+                                HKCategoryValueSleepAnalysis.asleepDeep.rawValue,
+                                HKCategoryValueSleepAnalysis.asleepREM.rawValue]
+        var out: [String: [SleepPart: Double]] = [:]
+        for (night, list) in byNight {
+            var use = list
+            let staged = list.filter { stages.contains($0.value) }
+            if !staged.isEmpty {
+                var counts: [String: Int] = [:]
+                for s in staged { counts[s.sourceRevision.source.bundleIdentifier, default: 0] += 1 }
+                if let best = counts.max(by: { $0.value < $1.value })?.key {
+                    use = list.filter { $0.sourceRevision.source.bundleIdentifier == best }
+                }
+            }
+            var parts: [SleepPart: Double] = [:]
+            for s in use {
+                let minutes = s.endDate.timeIntervalSince(s.startDate) / 60
+                switch s.value {
+                case HKCategoryValueSleepAnalysis.asleepDeep.rawValue: parts[.deep, default: 0] += minutes
+                case HKCategoryValueSleepAnalysis.asleepREM.rawValue: parts[.rem, default: 0] += minutes
+                case HKCategoryValueSleepAnalysis.asleepCore.rawValue: parts[.core, default: 0] += minutes
+                case HKCategoryValueSleepAnalysis.awake.rawValue: parts[.awake, default: 0] += minutes
+                case HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue:
+                    if staged.isEmpty { parts[.total, default: 0] += minutes }
+                default: break
+                }
+            }
+            if !staged.isEmpty {
+                parts[.total] = (parts[.deep] ?? 0) + (parts[.rem] ?? 0) + (parts[.core] ?? 0)
+            }
+            out[night] = parts
+        }
+        return out
     }
 
     private func dailyWorkoutCounts(_ start: Date, _ end: Date) async -> [String: Double]? {
@@ -655,6 +838,7 @@ final class HealthSync: ObservableObject {
         guard let start = Self.date(from: day),
               let end = Calendar.current.date(byAdding: .day, value: 1, to: start) else { return [:] }
         var result: [String: Any] = ["date": day]
+        var sleepParts: [SleepPart: Double]?
         for field in fields {
             let outcome: Outcome
             switch Self.catalog[field]! {
@@ -662,18 +846,24 @@ final class HealthSync: ObservableObject {
                 outcome = await sum(id, unit, start, end)
             case .latest(let id, let unit, let factor):
                 outcome = await latest(id, unit, start, end, factor)
+            case .avg(let id, let unit, let factor):
+                outcome = await average(id, unit, start, end, factor)
+            case .standHours:
+                guard let counts = await dailyStandHours(start, end) else { return nil }
+                if let h = counts[day], h > 0 { outcome = .value(h) } else { outcome = .none }
+            case .sleep(let part):
+                if sleepParts == nil {
+                    guard let nights = await dailySleep(start, end) else { return nil }
+                    sleepParts = nights[day] ?? [:]
+                }
+                if let m = sleepParts?[part], m > 0 { outcome = .value(m) } else { outcome = .none }
             case .workouts:
                 outcome = await workoutCount(start, end)
             }
             switch outcome {
             case .locked: return nil
             case .none: break
-            case .value(let v):
-                if ["weight", "bodyFat"].contains(field) {
-                    result[field] = (v * 10).rounded() / 10
-                } else {
-                    result[field] = Int(v.rounded())
-                }
+            case .value(let v): result[field] = Self.rounded(field, v)
             }
         }
         return result
@@ -694,6 +884,22 @@ final class HealthSync: ObservableObject {
                 if self.isLocked(error) { return cont.resume(returning: .locked) }
                 if let v = stats?.sumQuantity()?.doubleValue(for: unit), v > 0 {
                     cont.resume(returning: .value(v))
+                } else {
+                    cont.resume(returning: .none)
+                }
+            }
+            store.execute(q)
+        }
+    }
+
+    private func average(_ id: HKQuantityTypeIdentifier, _ unit: HKUnit, _ start: Date, _ end: Date, _ factor: Double) async -> Outcome {
+        guard let type = HKQuantityType.quantityType(forIdentifier: id) else { return .none }
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+        return await withCheckedContinuation { cont in
+            let q = HKStatisticsQuery(quantityType: type, quantitySamplePredicate: predicate, options: .discreteAverage) { _, stats, error in
+                if self.isLocked(error) { return cont.resume(returning: .locked) }
+                if let v = stats?.averageQuantity()?.doubleValue(for: unit), v > 0 {
+                    cont.resume(returning: .value(v * factor))
                 } else {
                     cont.resume(returning: .none)
                 }

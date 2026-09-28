@@ -42,10 +42,10 @@
           "UIBackgroundModes": [
             "fetch"
           ],
-          "NSCameraUsageDescription": "Maxxledger uses the camera to scan barcodes and take photos.",
-          "NSPhotoLibraryUsageDescription": "Maxxledger lets you pick photos from your library.",
-          "NSHealthShareUsageDescription": "MaxxLedger reads your activity, heart rate and weight to fill in your training and body pages.",
-          "NSHealthUpdateUsageDescription": "MaxxLedger reads your activity, heart rate and weight to fill in your training and body pages."
+          "NSCameraUsageDescription": "MaxxLedger uses the camera to scan barcodes and take photos of your meals and scale.",
+          "NSPhotoLibraryUsageDescription": "MaxxLedger lets you pick a photo of a meal or your scale.",
+          "NSHealthShareUsageDescription": "MaxxLedger reads your activity, heart rate, heart rate variability, cardio fitness, sleep and weight to fill in your training and body pages.",
+          "NSHealthUpdateUsageDescription": "MaxxLedger reads your activity, heart rate, heart rate variability, cardio fitness, sleep and weight to fill in your training and body pages."
         }
       },
       "scheme": {},
@@ -56,7 +56,7 @@
           "TARGETED_DEVICE_FAMILY": "1",
           "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
           "GENERATE_INFOPLIST_FILE": "NO",
-          "MARKETING_VERSION": "1.0.6",
+          "MARKETING_VERSION": "1.0.7",
           "CURRENT_PROJECT_VERSION": "1",
           "CODE_SIGN_STYLE": "Manual",
           "DEVELOPMENT_TEAM": "HVQYLCQ5X5",
@@ -69,7 +69,10 @@
         "properties": {
           "com.apple.developer.healthkit": true,
           "com.apple.developer.healthkit.access": [],
-          "com.apple.developer.healthkit.background-delivery": true
+          "com.apple.developer.healthkit.background-delivery": true,
+          "com.apple.developer.associated-domains": [
+            "webcredentials:maxxledger.duckdns.org"
+          ]
         }
       }
     }

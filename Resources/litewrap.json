@@ -13,13 +13,32 @@
       "rhr",
       "workouts",
       "weight",
-      "bodyFat"
+      "bodyFat",
+      "hrv",
+      "walkingHeartRate",
+      "vo2Max",
+      "standHours",
+      "walkingKm",
+      "flights",
+      "sleepMinutes",
+      "sleepDeep",
+      "sleepRem",
+      "sleepCore",
+      "sleepAwake",
+      "respiratoryRate",
+      "oxygen"
     ],
     "tokenHeader": "X-Ledger-Token",
     "workoutsPath": null
   },
-  "googleSignIn": false,
-  "bridges": null,
-  "cameraUsage": "Maxxledger uses the camera to scan barcodes and take photos.",
-  "photosUsage": "Maxxledger lets you pick photos from your library."
+  "googleSignIn": true,
+  "bridges": [
+    "health",
+    "scanBarcode",
+    "haptic",
+    "notify",
+    "keepAwake"
+  ],
+  "cameraUsage": "MaxxLedger uses the camera to scan barcodes and take photos of your meals and scale.",
+  "photosUsage": "MaxxLedger lets you pick a photo of a meal or your scale."
 }

@@ -20,7 +20,7 @@ struct AppConfig: Decodable {
 
     /// Native features the page may use (window.LiteWrap.features).
     var features: [String] {
-        let implemented = ["health", "scanBarcode", "haptic", "notify", "keepAwake"]
+        let implemented = ["health", "scanBarcode", "haptic", "notify", "keepAwake", "share"]
         // No list in litewrap.json: offer everything. The page only uses what it knows.
         return (bridges ?? implemented).filter { implemented.contains($0) && ($0 != "health" || health.enabled) }
     }

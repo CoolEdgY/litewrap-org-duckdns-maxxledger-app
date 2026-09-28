@@ -16,8 +16,10 @@ struct LiteWrapApp: App {
             case .active:
                 // Opening the app always catches up on the last 7 days.
                 HealthSync.shared.syncRecent(days: 7)
+                HealthSync.shared.startLiveToday()
             case .background:
                 HealthSync.shared.scheduleRefresh()
+                HealthSync.shared.stopLiveToday()
                 // Never keep the screen on when the app isn't in front.
                 UIApplication.shared.isIdleTimerDisabled = false
             default:

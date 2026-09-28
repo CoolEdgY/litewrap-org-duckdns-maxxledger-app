@@ -55,8 +55,27 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
         let features = (try? String(data: JSONEncoder().encode(cfg.features), encoding: .utf8)) ?? "[]"
         let js = "window.LiteWrap = {version: 1, health: \(health), paired: \(paired), healthTypes: \(types), features: \(features)};"
         let noDoubleTap = "var s=document.createElement('style');s.textContent='html{touch-action:manipulation}';document.head&&document.head.appendChild(s);"
+        // navigator.share through the native share sheet, only if the web view lacks it.
+        let sharePolyfill = """
+        if (!navigator.share && window.webkit && window.webkit.messageHandlers.litewrap) {
+          navigator.share = function (d) {
+            d = d || {};
+            return new Promise(function (resolve, reject) {
+              var id = 'share-' + Date.now();
+              function onReply(e) {
+                if (!e.detail || e.detail.type !== 'shared' || e.detail.id !== id) return;
+                window.removeEventListener('litewrap', onReply);
+                e.detail.done ? resolve() : reject(new DOMException('Share canceled', 'AbortError'));
+              }
+              window.addEventListener('litewrap', onReply);
+              window.webkit.messageHandlers.litewrap.postMessage({type: 'share', id: id, title: d.title || '', text: d.text || '', url: d.url || ''});
+            });
+          };
+        }
+        """
         return [WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: true),
-                WKUserScript(source: noDoubleTap, injectionTime: .atDocumentEnd, forMainFrameOnly: true)]
+                WKUserScript(source: noDoubleTap, injectionTime: .atDocumentEnd, forMainFrameOnly: true),
+                WKUserScript(source: sharePolyfill, injectionTime: .atDocumentStart, forMainFrameOnly: true)]
     }
 
     private func refreshUserScripts() {
@@ -112,6 +131,16 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
                     self?.notifyPage(["type": "barcodeError", "reason": reason], id: id)
                 }
             }
+        case "share":
+            let id = body["id"]
+            let title = body["title"] as? String ?? ""
+            let text = [body["text"] as? String, body["url"] as? String].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
+            let sheet = UIActivityViewController(activityItems: [text.isEmpty ? title : text], applicationActivities: nil)
+            if !title.isEmpty { sheet.setValue(title, forKey: "subject") }
+            sheet.completionWithItemsHandler = { [weak self] _, completed, _, _ in
+                self?.notifyPage(["type": "shared", "done": completed], id: id)
+            }
+            UIHelpers.topViewController()?.present(sheet, animated: true)
         case "haptic":
             Haptics.play(body["style"] as? String ?? "light")
         case "keepAwake":
