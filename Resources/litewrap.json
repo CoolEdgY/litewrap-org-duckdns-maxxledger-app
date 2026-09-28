@@ -18,9 +18,8 @@
     "tokenHeader": "X-Ledger-Token",
     "workoutsPath": null
   },
-  "bridges": [
-    "health"
-  ],
+  "googleSignIn": false,
+  "bridges": null,
   "cameraUsage": "Maxxledger uses the camera to scan barcodes and take photos.",
   "photosUsage": "Maxxledger lets you pick photos from your library."
 }

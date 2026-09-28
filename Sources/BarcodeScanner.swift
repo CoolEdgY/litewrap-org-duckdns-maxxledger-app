@@ -85,15 +85,11 @@ final class BarcodeScanner: NSObject, DataScannerViewControllerDelegate {
         finish(.cancelled)
     }
 
-    private func found(_ rawCode: String, _ rawFormat: String) {
-        guard !finished else { return }
-        var code = rawCode, format = rawFormat
-        // Scanners report UPC-A as EAN-13 with a leading 0.
-        if format == "ean13" && code.count == 13 && code.hasPrefix("0") {
-            code = String(code.dropFirst())
-            format = "upca"
-        }
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    /// UPC-A arrives as EAN-13 with a leading 0: kept as the 13-digit shop barcode, as MaxxLedger expects.
+    private func found(_ code: String, _ format: String) {
+        // UPC-E's check digit belongs to the expanded code, so only EAN/UPC-A are checked here.
+        guard !finished, format == "upce" || Self.validEAN(code) else { return }
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
         finish(.code(code, format))
     }
 
@@ -132,8 +128,17 @@ final class BarcodeScanner: NSObject, DataScannerViewControllerDelegate {
         switch s {
         case .ean8: return "ean8"
         case .upce: return "upce"
-        default: return code.count == 12 ? "upca" : "ean13"
+        default: return "ean13"
         }
+    }
+
+    /// Check digit test, so a misread is never sent to the page.
+    static func validEAN(_ code: String) -> Bool {
+        let d = code.compactMap { $0.wholeNumberValue }
+        guard d.count == code.count, [8, 12, 13].contains(d.count), let check = d.last else { return false }
+        var sum = 0
+        for (i, v) in d.dropLast().reversed().enumerated() { sum += v * (i % 2 == 0 ? 3 : 1) }
+        return (10 - sum % 10) % 10 == check
     }
 }
 
@@ -178,7 +183,6 @@ final class ScannerOverlay: UIView {
             label.centerXAnchor.constraint(equalTo: centerXAnchor),
             label.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -40)
         ])
-        _ = tint
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -217,7 +221,7 @@ final class AVScannerViewController: UIViewController, AVCaptureMetadataOutputOb
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
-        guard let device = AVCaptureDevice.default(for: .video),
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device),
               session.canAddInput(input) else {
             failed = true
@@ -263,7 +267,7 @@ final class AVScannerViewController: UIViewController, AVCaptureMetadataOutputOb
         switch obj.type {
         case .ean8: format = "ean8"
         case .upce: format = "upce"
-        default: format = code.count == 12 ? "upca" : "ean13"
+        default: format = "ean13"
         }
         onCode?(code, format)
     }

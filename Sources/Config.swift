@@ -16,11 +16,13 @@ struct AppConfig: Decodable {
     let backgroundColor: String?
     let health: Health
     let bridges: [String]?
+    let googleSignIn: Bool?
 
     /// Native features the page may use (window.LiteWrap.features).
     var features: [String] {
         let implemented = ["health", "scanBarcode", "haptic", "notify", "keepAwake"]
-        return (bridges ?? ["health"]).filter { implemented.contains($0) && ($0 != "health" || health.enabled) }
+        // No list in litewrap.json: offer everything. The page only uses what it knows.
+        return (bridges ?? implemented).filter { implemented.contains($0) && ($0 != "health" || health.enabled) }
     }
 
     static let shared: AppConfig = {

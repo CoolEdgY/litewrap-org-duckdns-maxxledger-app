@@ -2,13 +2,17 @@ import SwiftUI
 import WebKit
 import UIKit
 import SafariServices
+import AuthenticationServices
 
 /// Owns the WKWebView, the `litewrap` bridge and the offline state.
-final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
+                           ASWebAuthenticationPresentationContextProviding {
     @Published var offline = false
     @Published var showStatus = false
 
     let webView: WKWebView
+    private var authSession: ASWebAuthenticationSession?
+    private var allowGoogleInWebViewOnce = false
     private let config = AppConfig.shared
 
     /// Sign-in pages that must stay inside the app, or sign-in would break.
@@ -24,15 +28,7 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
         wk.applicationNameForUserAgent = "Version/17.0 Mobile/15E148 Safari/604.1 LiteWrap/1"
 
         let content = WKUserContentController()
-        let paired = HealthSync.shared.isPaired ? "true" : "false"
-        let health = cfg.health.enabled ? "true" : "false"
-        let types = (try? String(data: JSONEncoder().encode(cfg.health.types), encoding: .utf8)) ?? "[]"
-        let features = (try? String(data: JSONEncoder().encode(cfg.features), encoding: .utf8)) ?? "[]"
-        let js = "window.LiteWrap = {version: 1, health: \(health), paired: \(paired), healthTypes: \(types), features: \(features)};"
-        content.addUserScript(WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: true))
-        // Block double-tap zoom but keep pinch zoom and the phone's text size.
-        let noDoubleTap = "var s=document.createElement('style');s.textContent='html{touch-action:manipulation}';document.head&&document.head.appendChild(s);"
-        content.addUserScript(WKUserScript(source: noDoubleTap, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        for script in WebController.userScripts() { content.addUserScript(script) }
         wk.userContentController = content
 
         webView = WKWebView(frame: .zero, configuration: wk)
@@ -48,6 +44,25 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
         // The page handles the notch and home bar itself with env(safe-area-inset-*).
         webView.scrollView.contentInsetAdjustmentBehavior = .never
         load()
+    }
+
+    /// window.LiteWrap (rebuilt after pairing, so a reload shows the new state) and the double-tap zoom block.
+    static func userScripts() -> [WKUserScript] {
+        let cfg = AppConfig.shared
+        let paired = HealthSync.shared.isPaired ? "true" : "false"
+        let health = cfg.health.enabled ? "true" : "false"
+        let types = (try? String(data: JSONEncoder().encode(cfg.health.types), encoding: .utf8)) ?? "[]"
+        let features = (try? String(data: JSONEncoder().encode(cfg.features), encoding: .utf8)) ?? "[]"
+        let js = "window.LiteWrap = {version: 1, health: \(health), paired: \(paired), healthTypes: \(types), features: \(features)};"
+        let noDoubleTap = "var s=document.createElement('style');s.textContent='html{touch-action:manipulation}';document.head&&document.head.appendChild(s);"
+        return [WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: true),
+                WKUserScript(source: noDoubleTap, injectionTime: .atDocumentEnd, forMainFrameOnly: true)]
+    }
+
+    private func refreshUserScripts() {
+        let c = webView.configuration.userContentController
+        c.removeAllUserScripts()
+        for script in WebController.userScripts() { c.addUserScript(script) }
     }
 
     func load() {
@@ -73,10 +88,12 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
         case "pair":
             guard let token = body["token"] as? String, let url = body["url"] as? String else { return }
             HealthSync.shared.pair(token: token, url: url) { [weak self] in
+                self?.refreshUserScripts()
                 self?.notifyPage(["type": "paired"])
             }
         case "unpair":
             HealthSync.shared.unpair()
+            refreshUserScripts()
             notifyPage(["type": "unpaired"])
         case "status":
             showStatus = true
@@ -133,6 +150,15 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url else { return decisionHandler(.allow) }
         let scheme = url.scheme?.lowercased() ?? ""
+        // Google sign-in runs in Apple's secure sign-in window, never inside the web view.
+        if config.googleSignIn == true, url.host?.lowercased() == "accounts.google.com",
+           navigationAction.targetFrame?.isMainFrame ?? true {
+            if allowGoogleInWebViewOnce {
+                allowGoogleInWebViewOnce = false
+            } else if startGoogleSignIn(url) {
+                return decisionHandler(.cancel)
+            }
+        }
         if ["tel", "mailto", "sms", "facetime", "itms-apps", "maps"].contains(scheme) {
             UIApplication.shared.open(url)
             return decisionHandler(.cancel)
@@ -154,6 +180,40 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKU
             if isInternal(url) { webView.load(navigationAction.request) } else { UIHelpers.openInSafari(url) }
         }
         return nil
+    }
+
+    // MARK: Google sign-in
+
+    /// Opens Google in ASWebAuthenticationSession. When Google sends the browser back to the site's own
+    /// callback (redirect_uri), that final URL is loaded in the web view, so the session cookie lands there.
+    private func startGoogleSignIn(_ url: URL) -> Bool {
+        guard #available(iOS 17.4, *) else { return false }
+        guard let redirect = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "redirect_uri" })?.value,
+              let callback = URL(string: redirect), let host = callback.host else { return false }
+        let session = ASWebAuthenticationSession(url: url, callback: .https(host: host, path: callback.path)) { [weak self] result, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.authSession = nil
+                if let result {
+                    self.webView.load(URLRequest(url: result))
+                    return
+                }
+                if let e = error as? ASWebAuthenticationSessionError, e.code == .canceledLogin { return }
+                // The secure window could not be used (for example the site's association file is missing):
+                // sign in inside the app instead, like before.
+                self.allowGoogleInWebViewOnce = true
+                self.webView.load(URLRequest(url: url))
+            }
+        }
+        session.presentationContextProvider = self
+        session.prefersEphemeralWebBrowserSession = false
+        authSession = session
+        return session.start()
+    }
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        UIHelpers.keyWindow ?? ASPresentationAnchor()
     }
 
     /// Camera for the app's own pages: allowed once by iOS, not asked again on every page load.
